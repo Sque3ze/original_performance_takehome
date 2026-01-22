@@ -6,6 +6,7 @@ reference kernel for testing.
 """
 
 from copy import copy
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
@@ -270,14 +271,23 @@ class Machine:
         match slot:
             case ("load", dest, addr):
                 # print(dest, addr, core.scratch[addr])
-                self.scratch_write[dest] = self.mem[core.scratch[addr]]
+                addr = core.scratch[addr]
+                if os.getenv("CHECK_MEM_BOUNDS") == "1":
+                    if addr < 0 or addr >= len(self.mem):
+                        raise IndexError(f"load addr out of range: {addr} len={len(self.mem)} pc={core.pc}")
+                self.scratch_write[dest] = self.mem[addr]
             case ("load_offset", dest, addr, offset):
                 # Handy for treating vector dest and addr as a full block in the mini-compiler if you want
-                self.scratch_write[dest + offset] = self.mem[
-                    core.scratch[addr + offset]
-                ]
+                addr = core.scratch[addr + offset]
+                if os.getenv("CHECK_MEM_BOUNDS") == "1":
+                    if addr < 0 or addr >= len(self.mem):
+                        raise IndexError(f"load_offset addr out of range: {addr} len={len(self.mem)} pc={core.pc}")
+                self.scratch_write[dest + offset] = self.mem[addr]
             case ("vload", dest, addr):  # addr is a scalar
                 addr = core.scratch[addr]
+                if os.getenv("CHECK_MEM_BOUNDS") == "1":
+                    if addr < 0 or addr + VLEN > len(self.mem):
+                        raise IndexError(f"vload addr out of range: {addr} len={len(self.mem)} pc={core.pc}")
                 for vi in range(VLEN):
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
             case ("const", dest, val):
@@ -289,9 +299,15 @@ class Machine:
         match slot:
             case ("store", addr, src):
                 addr = core.scratch[addr]
+                if os.getenv("CHECK_MEM_BOUNDS") == "1":
+                    if addr < 0 or addr >= len(self.mem):
+                        raise IndexError(f"store addr out of range: {addr} len={len(self.mem)} pc={core.pc}")
                 self.mem_write[addr] = core.scratch[src]
             case ("vstore", addr, src):  # addr is a scalar
                 addr = core.scratch[addr]
+                if os.getenv("CHECK_MEM_BOUNDS") == "1":
+                    if addr < 0 or addr + VLEN > len(self.mem):
+                        raise IndexError(f"vstore addr out of range: {addr} len={len(self.mem)} pc={core.pc}")
                 for vi in range(VLEN):
                     self.mem_write[addr + vi] = core.scratch[src + vi]
             case _:
