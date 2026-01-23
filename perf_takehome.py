@@ -47,6 +47,7 @@ class KernelBuilder:
         self.const_map = {}
         self.labels = {}
         self.fixups = []
+        self.sched_diag = None
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -210,89 +211,129 @@ class KernelBuilder:
                 ops_by_block[b] = [
                     (i, engine, slot) for i, (engine, slot) in enumerate(ops)
                 ]
+        diag_enabled = os.getenv("SCHED_DIAG", "0") == "1"
+        if diag_enabled and self.sched_diag is None:
+            self.sched_diag = {
+                "cycles": 0,
+                "no_candidate": defaultdict(int),
+                "rejects": defaultdict(int),
+            }
+
+        remaining_slots = defaultdict(int)
+        for ops in ops_by_block:
+            for _seq, engine, _slot in ops:
+                remaining_slots[engine] += 1
         while any(ops_by_block[b] for b in range(n_blocks)):
             bundle = defaultdict(list)
             counts = defaultdict(int)
             block_used = [False] * n_blocks
             block_single = [False] * n_blocks
             block_sched = [[] for _ in range(n_blocks)]
-            progressed = True
-            while progressed:
-                progressed = False
-                for bi in range(n_blocks):
-                    b = (rr + bi) % n_blocks
-                    ops = ops_by_block[b]
-                    if not ops:
-                        continue
-                    if block_single[b] and block_used[b]:
-                        continue
+            priority = sorted(
+                [
+                    e
+                    for e in SLOT_LIMITS.keys()
+                    if e != "debug" and remaining_slots.get(e, 0) > 0
+                ],
+                key=lambda e: remaining_slots.get(e, 0) / SLOT_LIMITS[e],
+                reverse=True,
+            )
+            for engine in priority:
+                limit = SLOT_LIMITS[engine]
+                while counts[engine] < limit:
+                    scheduled_any = False
+                    for bi in range(n_blocks):
+                        b = (rr + bi) % n_blocks
+                        ops = ops_by_block[b]
+                        if not ops:
+                            continue
+                        if block_single[b] and block_used[b]:
+                            continue
 
-                    prior_reads = set()
-                    prior_writes = set()
-                    chosen = None
-                    chosen_reads = None
-                    chosen_writes = None
-                    for oi, (seq, engine, slot) in enumerate(ops[:window]):
-                        reads, writes = self._slot_reads_writes(engine, slot)
-                        if reads is None or writes is None:
-                            # Unknown slot shape; treat as a barrier.
-                            if oi == 0 and not block_used[b]:
-                                chosen = (seq, engine, slot, oi)
-                                chosen_reads = set()
-                                chosen_writes = set()
-                                block_single[b] = True
+                        prior_reads = set()
+                        prior_writes = set()
+                        chosen = None
+                        chosen_reads = None
+                        chosen_writes = None
+                        chosen_unknown = False
+
+                        for oi, (seq, op_engine, slot) in enumerate(ops[:window]):
+                            reads, writes = self._slot_reads_writes(op_engine, slot)
+                            if reads is None or writes is None:
+                                # Unknown slot shape; treat as a barrier.
+                                if oi == 0 and not block_used[b] and op_engine == engine:
+                                    chosen = (seq, op_engine, slot, oi)
+                                    chosen_unknown = True
+                                elif diag_enabled and op_engine == engine:
+                                    self.sched_diag["rejects"]["barrier"] += 1
+                                break
+
+                            # Can't move this op ahead of earlier unscheduled ops if it would
+                            # violate RAW/WAW/WAR with those earlier ops.
+                            if reads & prior_writes or writes & prior_writes:
+                                if diag_enabled and op_engine == engine:
+                                    if reads & prior_writes:
+                                        self.sched_diag["rejects"]["raw"] += 1
+                                    if writes & prior_writes:
+                                        self.sched_diag["rejects"]["waw"] += 1
+                                prior_reads.update(reads)
+                                prior_writes.update(writes)
+                                continue
+
+                            if op_engine != engine:
+                                prior_reads.update(reads)
+                                prior_writes.update(writes)
+                                continue
+
+                            # Same-cycle hazards within the block.
+                            conflict = False
+                            for sched_seq, sched_reads, sched_writes in block_sched[b]:
+                                if writes & sched_writes:
+                                    conflict = True
+                                    break
+                                if reads & sched_writes and sched_seq < seq:
+                                    conflict = True
+                                    break
+                            if conflict:
+                                if diag_enabled and op_engine == engine:
+                                    self.sched_diag["rejects"]["cycle_conflict"] += 1
+                                prior_reads.update(reads)
+                                prior_writes.update(writes)
+                                continue
+
+                            chosen = (seq, op_engine, slot, oi)
+                            chosen_reads = reads
+                            chosen_writes = writes
                             break
 
-                        if counts[engine] >= SLOT_LIMITS[engine]:
-                            prior_reads.update(reads)
-                            prior_writes.update(writes)
+                        if chosen is None:
                             continue
 
-                        # Can't move this op ahead of earlier unscheduled ops if it would
-                        # violate RAW/WAW/WAR with those earlier ops.
-                        if reads & prior_writes or writes & (prior_writes | prior_reads):
-                            prior_reads.update(reads)
-                            prior_writes.update(writes)
-                            continue
+                        seq, op_engine, slot, oi = chosen
+                        bundle[op_engine].append(slot)
+                        counts[op_engine] += 1
+                        remaining_slots[op_engine] -= 1
+                        if chosen_unknown:
+                            block_single[b] = True
+                        elif chosen_reads is not None and chosen_writes is not None:
+                            block_sched[b].append((seq, chosen_reads, chosen_writes))
+                        block_used[b] = True
+                        ops.pop(oi)
+                        scheduled_any = True
+                        if counts[engine] >= limit:
+                            break
 
-                        # Same-cycle hazards within the block.
-                        conflict = False
-                        for sched_seq, sched_reads, sched_writes in block_sched[b]:
-                            if writes & sched_writes:
-                                conflict = True
-                                break
-                            if reads & sched_writes and sched_seq < seq:
-                                conflict = True
-                                break
-                            if writes & sched_reads and sched_seq > seq:
-                                conflict = True
-                                break
-                        if conflict:
-                            prior_reads.update(reads)
-                            prior_writes.update(writes)
-                            continue
-
-                        chosen = (seq, engine, slot, oi)
-                        chosen_reads = reads
-                        chosen_writes = writes
+                    if not scheduled_any:
                         break
-
-                    if chosen is None:
-                        continue
-
-                    seq, engine, slot, oi = chosen
-                    bundle[engine].append(slot)
-                    counts[engine] += 1
-                    if chosen_reads is not None and chosen_writes is not None:
-                        block_sched[b].append((seq, chosen_reads, chosen_writes))
-                    block_used[b] = True
-                    ops.pop(oi)
-                    progressed = True
+                if diag_enabled and counts[engine] < limit and remaining_slots.get(engine, 0) > 0:
+                    self.sched_diag["no_candidate"][engine] += (limit - counts[engine])
 
             if not bundle:
                 break
             self.instrs.append(dict(bundle))
             rr = (rr + 1) % n_blocks
+            if diag_enabled:
+                self.sched_diag["cycles"] += 1
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
@@ -348,13 +389,13 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        v_three = self.alloc_scratch("v_three", VLEN)
 
         vbroadcasts = [
             (v_zero, zero_const),
             (v_one, one_const),
             (v_two, two_const),
-            (v_forest_p, self.scratch["forest_values_p"]),
+            (v_three, self.scratch_const(3)),
         ]
 
         # Hash constants and fused stages
@@ -387,11 +428,6 @@ class KernelBuilder:
                 hash_plan.append(("normal", op1, v_c1, op2, op3, v_c3))
 
         self.emit_vbroadcasts(vbroadcasts)
-        v_one_plus_forest_p = self.alloc_scratch("v_one_plus_forest_p", VLEN)
-        v_one_minus_forest_p = self.alloc_scratch("v_one_minus_forest_p", VLEN)
-        self.emit_cycle([("valu", ("+", v_one_plus_forest_p, v_one, v_forest_p))])
-        self.emit_cycle([("valu", ("-", v_one_minus_forest_p, v_one, v_forest_p))])
-
         hash_scalar_consts = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             c1 = self.scratch_const(val1)
@@ -403,7 +439,7 @@ class KernelBuilder:
         node_vals_s = []
         node_idx_consts = []
         depth_offsets = []
-        v_node_idx_all = None
+        v_node_off_all = None
         v_node_val_all = None
         v_depth1_diff = None
         v_depth2_diff10 = None
@@ -416,31 +452,42 @@ class KernelBuilder:
                 self.alloc_scratch(f"node_val_s_{i}") for i in range(max_group_node + 1)
             ]
             node_idx_consts = [self.scratch_const(i) for i in range(max_group_node + 1)]
+            node_addr_s = [
+                self.alloc_scratch(f"node_addr_s_{i}") for i in range(max_group_node + 1)
+            ]
             offset = 0
             for depth in range(shallow_group_depth + 1):
                 depth_offsets.append(offset)
                 offset += (1 << depth) * VLEN
-            v_node_idx_all = self.alloc_scratch(
-                "v_node_idx_all", total_group_nodes * VLEN
+            v_node_off_all = self.alloc_scratch(
+                "v_node_off_all", total_group_nodes * VLEN
             )
             v_node_val_all = self.alloc_scratch(
                 "v_node_val_all", total_group_nodes * VLEN
             )
+            addr_ops = []
             for node_idx in range(max_group_node + 1):
-                self.emit_cycle(
-                    [
+                addr_ops.append(
+                    (
+                        "alu",
                         (
-                            "alu",
-                            (
-                                "+",
-                                tmp1,
-                                self.scratch["forest_values_p"],
-                                node_idx_consts[node_idx],
-                            ),
-                        )
-                    ]
+                            "+",
+                            node_addr_s[node_idx],
+                            self.scratch["forest_values_p"],
+                            node_idx_consts[node_idx],
+                        ),
+                    )
                 )
-                self.emit_cycle([("load", ("load", node_vals_s[node_idx], tmp1))])
+                if len(addr_ops) == SLOT_LIMITS["alu"]:
+                    self.emit_cycle(addr_ops)
+                    addr_ops = []
+            if addr_ops:
+                self.emit_cycle(addr_ops)
+            for i in range(0, max_group_node + 1, SLOT_LIMITS["load"]):
+                slots = []
+                for j in range(i, min(max_group_node + 1, i + SLOT_LIMITS["load"])):
+                    slots.append(("load", ("load", node_vals_s[j], node_addr_s[j])))
+                self.emit_cycle(slots)
             idx_pairs = []
             val_pairs = []
             for depth in range(shallow_group_depth + 1):
@@ -451,8 +498,8 @@ class KernelBuilder:
                     node_idx = base + node_k
                     idx_pairs.append(
                         (
-                            v_node_idx_all + depth_off + node_k * VLEN,
-                            node_idx_consts[node_idx],
+                            v_node_off_all + depth_off + node_k * VLEN,
+                            node_idx_consts[node_k],
                         )
                     )
                     val_pairs.append(
@@ -510,6 +557,21 @@ class KernelBuilder:
                         (v_depth2_diff30, diff2_30_s),
                     ]
                 )
+
+        # Precompute per-depth base pointers for offset indexing on non-grouped depths.
+        base_ptrs = [None] * (forest_height + 1)
+        base_ptr_ops = []
+        for depth in range(forest_height + 1):
+            if use_shallow_grouping and depth <= shallow_group_depth:
+                continue
+            base_idx_const = self.scratch_const((1 << depth) - 1)
+            base_ptr = self.alloc_scratch(f"base_ptr_d{depth}")
+            base_ptr_ops.append(
+                ("alu", ("+", base_ptr, self.scratch["forest_values_p"], base_idx_const))
+            )
+            base_ptrs[depth] = base_ptr
+        for i in range(0, len(base_ptr_ops), SLOT_LIMITS["alu"]):
+            self.emit_cycle(base_ptr_ops[i : i + SLOT_LIMITS["alu"]])
 
         idx_addr = self.alloc_scratch("idx_addr")
         val_addr = self.alloc_scratch("val_addr")
@@ -816,26 +878,14 @@ class KernelBuilder:
             self.schedule_wave(ops_by_block, rr_start=0)
 
         else:
-            # Load idx/val into scratch directly
-            ops_by_block = []
-            for bi in range(blocks):
-                off_const = block_offsets[bi]
-                ops = [
-                    ("alu", ("+", idx_addr_b[bi], self.scratch["inp_indices_p"], off_const)),
-                    ("alu", ("+", val_addr_b[bi], self.scratch["inp_values_p"], off_const)),
-                    ("load", ("vload", idx_all + bi * VLEN, idx_addr_b[bi])),
-                    ("load", ("vload", val_all + bi * VLEN, val_addr_b[bi])),
-                ]
-                ops_by_block.append(ops)
-            self.schedule_wave(ops_by_block, rr_start=0)
-
-            # Pause instructions are matched up with yield statements in the reference
-            # kernel to let you debug at intermediate steps. The testing harness in this
-            # file requires these match up to the reference kernel's yields, but the
-            # submission harness ignores them.
-            self.add("flow", ("pause",))
+            # Initial vloads are scheduled together with rounds below.
+            pass
 
         start_round = group_depth + 1 if partition_grouping else 0
+        start_depth = start_round % (forest_height + 1)
+        start_base_idx_const = None
+        if start_depth:
+            start_base_idx_const = self.scratch_const((1 << start_depth) - 1)
 
         use_flow_select = os.getenv("USE_FLOW_SELECT", "0") == "1"
         flow_select_depth1 = os.getenv("FLOW_SELECT_DEPTH1", "1") == "1"
@@ -844,7 +894,7 @@ class KernelBuilder:
             flow_select_depth1 = True
             flow_select_depth2 = True
         fast_depth2_select = os.getenv("FAST_DEPTH2_SELECT", "1") != "0"
-        wave_size = int(os.getenv("WAVE_SIZE", "88"))
+        wave_size = int(os.getenv("WAVE_SIZE", "468"))
         num_tmp = 3 if flow_select_depth2 else 2
         max_wave = (SCRATCH_SIZE - self.scratch_ptr) // (VLEN * num_tmp)
         if max_wave < 1:
@@ -864,7 +914,6 @@ class KernelBuilder:
             ]
 
         round_plans = []
-        idx_is_address = False
         for round in range(start_round, rounds):
             depth = round % (forest_height + 1)
             use_grouping_round = use_shallow_grouping and depth <= shallow_group_depth
@@ -874,19 +923,14 @@ class KernelBuilder:
             else:
                 num_nodes = 0
                 depth_offset = 0
-            transition_to_addr = (
-                use_shallow_grouping
-                and depth == shallow_group_depth
-                and shallow_group_depth < forest_height
-            )
-            round_plans.append(
-                (depth, use_grouping_round, num_nodes, depth_offset, idx_is_address, transition_to_addr)
-            )
-            if depth == forest_height:
-                idx_is_address = False
-            elif transition_to_addr:
-                idx_is_address = True
-        final_idx_is_address = idx_is_address
+            round_plans.append((depth, use_grouping_round, num_nodes, depth_offset))
+
+        if not partition_grouping:
+            # Pause instructions are matched up with yield statements in the reference
+            # kernel to let you debug at intermediate steps. The testing harness in this
+            # file requires these match up to the reference kernel's yields, but the
+            # submission harness ignores them.
+            self.add("flow", ("pause",))
 
         for wi in range(waves):
             ops_by_block = []
@@ -896,122 +940,92 @@ class KernelBuilder:
                 if block_idx >= blocks:
                     ops_by_block.append([])
                     continue
-                ops = []
                 idx_vec = idx_all + block_idx * VLEN
                 val_vec = val_all + block_idx * VLEN
-
-                for (
-                    depth,
-                    use_grouping_round,
-                    num_nodes,
-                    depth_offset,
-                    idx_is_address,
-                    transition_to_addr,
-                ) in round_plans:
+                ops = []
+                if not partition_grouping:
+                    off_const = block_offsets[block_idx]
+                    ops.extend(
+                        [
+                            (
+                                "alu",
+                                (
+                                    "+",
+                                    idx_addr_b[block_idx],
+                                    self.scratch["inp_indices_p"],
+                                    off_const,
+                                ),
+                            ),
+                            (
+                                "alu",
+                                (
+                                    "+",
+                                    val_addr_b[block_idx],
+                                    self.scratch["inp_values_p"],
+                                    off_const,
+                                ),
+                            ),
+                            ("load", ("vload", idx_vec, idx_addr_b[block_idx])),
+                            ("load", ("vload", val_vec, val_addr_b[block_idx])),
+                        ]
+                    )
+                if start_base_idx_const is not None:
+                    for lane in range(VLEN):
+                        ops.append(
+                            (
+                                "alu",
+                                (
+                                    "-",
+                                    idx_vec + lane,
+                                    idx_vec + lane,
+                                    start_base_idx_const,
+                                ),
+                            )
+                        )
+                for (depth, use_grouping_round, num_nodes, depth_offset) in round_plans:
+                    node_val_src = None
                     if use_grouping_round:
                         if depth == 0:
-                            ops.append(
-                                (
-                                    "valu",
-                                    (
-                                        "+",
-                                        tmp2_vec_b[bi],
-                                        v_node_val_all + depth_offset,
-                                        v_zero,
-                                    ),
-                                )
-                            )
+                            node_val_src = v_node_val_all + depth_offset
                         elif depth == 1:
                             if flow_select_depth1:
-                                # mask for right child
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "==",
-                                            tmp1_vec_b[bi],
-                                            idx_vec,
-                                            v_node_idx_all + depth_offset + VLEN,
-                                        ),
-                                    )
-                                )
+                                # off is 0/1; use it directly as mask
                                 ops.append(
                                     (
                                         "flow",
                                         (
                                             "vselect",
                                             tmp2_vec_b[bi],
-                                            tmp1_vec_b[bi],
+                                            idx_vec,
                                             v_node_val_all + depth_offset + VLEN,
                                             v_node_val_all + depth_offset,
                                         ),
                                     )
                                 )
                             else:
-                                # off = idx - base (0 or 1)
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "-",
-                                            tmp1_vec_b[bi],
-                                            idx_vec,
-                                            v_node_idx_all + depth_offset,
-                                        ),
-                                    )
-                                )
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "+",
-                                            tmp2_vec_b[bi],
-                                            v_node_val_all + depth_offset,
-                                            v_zero,
-                                        ),
-                                    )
-                                )
                                 ops.append(
                                     (
                                         "valu",
                                         (
                                             "multiply_add",
                                             tmp2_vec_b[bi],
-                                            tmp1_vec_b[bi],
+                                            idx_vec,
                                             v_depth1_diff,
-                                            tmp2_vec_b[bi],
+                                            v_node_val_all + depth_offset,
                                         ),
                                     )
                                 )
+                            node_val_src = tmp2_vec_b[bi]
                         else:
                             if flow_select_depth2 and depth == 2:
-                                # leaf = idx - base (0..3)
+                                # b0 = off & 1, b1 = off >> 1
                                 ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "-",
-                                            tmp1_vec_b[bi],
-                                            idx_vec,
-                                            v_node_idx_all + depth_offset,
-                                        ),
-                                    )
+                                    ("valu", ("&", tmp1_vec_b[bi], idx_vec, v_one))
                                 )
-                                # mask_hi = leaf >> 1
                                 ops.append(
-                                    (
-                                        "valu",
-                                        (">>", tmp2_vec_b[bi], tmp1_vec_b[bi], v_one),
-                                    )
+                                    ("valu", (">>", tmp2_vec_b[bi], idx_vec, v_one))
                                 )
-                                # mask_lo = leaf & 1
-                                ops.append(
-                                    (
-                                        "valu",
-                                        ("&", tmp1_vec_b[bi], tmp1_vec_b[bi], v_one),
-                                    )
-                                )
-                                # left = select(node4, node3) by mask_lo
+                                # left = select(node1, node0) by b0
                                 ops.append(
                                     (
                                         "flow",
@@ -1024,7 +1038,7 @@ class KernelBuilder:
                                         ),
                                     )
                                 )
-                                # right = select(node6, node5) by mask_lo
+                                # right = select(node3, node2) by b0
                                 ops.append(
                                     (
                                         "flow",
@@ -1037,7 +1051,7 @@ class KernelBuilder:
                                         ),
                                     )
                                 )
-                                # node_val = select(right, left) by mask_hi
+                                # node_val = select(right, left) by b1
                                 ops.append(
                                     (
                                         "flow",
@@ -1050,6 +1064,7 @@ class KernelBuilder:
                                         ),
                                     )
                                 )
+                                node_val_src = tmp2_vec_b[bi]
                             elif (
                                 depth == 2
                                 and fast_depth2_select
@@ -1060,21 +1075,10 @@ class KernelBuilder:
                                     (
                                         "valu",
                                         (
-                                            "+",
-                                            tmp2_vec_b[bi],
-                                            v_node_val_all + depth_offset,
-                                            v_zero,
-                                        ),
-                                    )
-                                )
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
                                             "==",
                                             tmp1_vec_b[bi],
                                             idx_vec,
-                                            v_node_idx_all + depth_offset + VLEN,
+                                            v_one,
                                         ),
                                     )
                                 )
@@ -1086,7 +1090,7 @@ class KernelBuilder:
                                             tmp2_vec_b[bi],
                                             tmp1_vec_b[bi],
                                             v_depth2_diff10,
-                                            tmp2_vec_b[bi],
+                                            v_node_val_all + depth_offset,
                                         ),
                                     )
                                 )
@@ -1097,7 +1101,7 @@ class KernelBuilder:
                                             "==",
                                             tmp1_vec_b[bi],
                                             idx_vec,
-                                            v_node_idx_all + depth_offset + 2 * VLEN,
+                                            v_two,
                                         ),
                                     )
                                 )
@@ -1120,7 +1124,7 @@ class KernelBuilder:
                                             "==",
                                             tmp1_vec_b[bi],
                                             idx_vec,
-                                            v_node_idx_all + depth_offset + 3 * VLEN,
+                                            v_three,
                                         ),
                                     )
                                 )
@@ -1136,6 +1140,7 @@ class KernelBuilder:
                                         ),
                                     )
                                 )
+                                node_val_src = tmp2_vec_b[bi]
                             else:
                                 # tmp2_vec_b holds node_val accumulator
                                 ops.append(("valu", ("+", tmp2_vec_b[bi], v_zero, v_zero)))
@@ -1147,7 +1152,7 @@ class KernelBuilder:
                                                 "==",
                                                 tmp1_vec_b[bi],
                                                 idx_vec,
-                                                v_node_idx_all
+                                                v_node_off_all
                                                 + depth_offset
                                                 + node_k * VLEN,
                                             ),
@@ -1167,22 +1172,30 @@ class KernelBuilder:
                                             ),
                                         )
                                     )
+                                node_val_src = tmp2_vec_b[bi]
                     else:
-                        if idx_is_address:
-                            for lane in range(VLEN):
-                                ops.append(
-                                    ("load", ("load_offset", tmp2_vec_b[bi], idx_vec, lane))
-                                )
-                        else:
-                            ops.append(("valu", ("+", tmp1_vec_b[bi], idx_vec, v_forest_p)))
-                            for lane in range(VLEN):
-                                ops.append(
+                        base_ptr = base_ptrs[depth]
+                        for lane in range(VLEN):
+                            ops.append(
+                                (
+                                    "alu",
                                     (
-                                        "load",
-                                        ("load_offset", tmp2_vec_b[bi], tmp1_vec_b[bi], lane),
-                                    )
+                                        "+",
+                                        tmp1_vec_b[bi] + lane,
+                                        idx_vec + lane,
+                                        base_ptr,
+                                    ),
                                 )
-                    ops.append(("valu", ("^", val_vec, val_vec, tmp2_vec_b[bi])))
+                            )
+                        for lane in range(VLEN):
+                            ops.append(
+                                (
+                                    "load",
+                                    ("load_offset", tmp2_vec_b[bi], tmp1_vec_b[bi], lane),
+                                )
+                            )
+                        node_val_src = tmp2_vec_b[bi]
+                    ops.append(("valu", ("^", val_vec, val_vec, node_val_src)))
 
                     for entry in hash_plan:
                         if entry[0] == "fused":
@@ -1199,54 +1212,41 @@ class KernelBuilder:
                             )
 
                     if depth == forest_height:
-                        ops.append(("valu", ("^", idx_vec, idx_vec, idx_vec)))
+                        ops.append(("valu", ("+", idx_vec, v_zero, v_zero)))
                     else:
                         ops.append(("valu", ("&", tmp1_vec_b[bi], val_vec, v_one)))
-                        if idx_is_address:
-                            ops.append(
-                                (
-                                    "valu",
-                                    ("+", tmp1_vec_b[bi], tmp1_vec_b[bi], v_one_minus_forest_p),
-                                )
-                            )
-                        elif transition_to_addr:
-                            ops.append(
-                                (
-                                    "valu",
-                                    ("+", tmp1_vec_b[bi], tmp1_vec_b[bi], v_one_plus_forest_p),
-                                )
-                            )
-                        else:
-                            ops.append(
-                                ("valu", ("+", tmp1_vec_b[bi], tmp1_vec_b[bi], v_one))
-                            )
                         ops.append(
                             ("valu", ("multiply_add", idx_vec, idx_vec, v_two, tmp1_vec_b[bi]))
                         )
+
+                if not partition_grouping:
+                    ops.extend(
+                        [
+                            ("store", ("vstore", idx_addr_b[block_idx], idx_vec)),
+                            ("store", ("vstore", val_addr_b[block_idx], val_vec)),
+                        ]
+                    )
 
                 ops_by_block.append(ops)
 
             self.schedule_wave(ops_by_block, rr_start=0)
 
-        ops_by_block = []
-        for bi in range(blocks):
-            off_const = block_offsets[bi]
-            ops = [
-                ("alu", ("+", idx_addr_b[bi], self.scratch["inp_indices_p"], off_const)),
-                ("alu", ("+", val_addr_b[bi], self.scratch["inp_values_p"], off_const)),
-            ]
-            if final_idx_is_address:
-                ops.append(
-                    ("valu", ("-", idx_all + bi * VLEN, idx_all + bi * VLEN, v_forest_p))
-                )
-            ops.extend(
-                [
-                    ("store", ("vstore", idx_addr_b[bi], idx_all + bi * VLEN)),
-                    ("store", ("vstore", val_addr_b[bi], val_all + bi * VLEN)),
+        if partition_grouping:
+            ops_by_block = []
+            for bi in range(blocks):
+                off_const = block_offsets[bi]
+                ops = [
+                    ("alu", ("+", idx_addr_b[bi], self.scratch["inp_indices_p"], off_const)),
+                    ("alu", ("+", val_addr_b[bi], self.scratch["inp_values_p"], off_const)),
                 ]
-            )
-            ops_by_block.append(ops)
-        self.schedule_wave(ops_by_block, rr_start=0)
+                ops.extend(
+                    [
+                        ("store", ("vstore", idx_addr_b[bi], idx_all + bi * VLEN)),
+                        ("store", ("vstore", val_addr_b[bi], val_all + bi * VLEN)),
+                    ]
+                )
+                ops_by_block.append(ops)
+            self.schedule_wave(ops_by_block, rr_start=0)
 
         # Scalar tail for non-multiple of VLEN
         if tail_start < batch_size:
