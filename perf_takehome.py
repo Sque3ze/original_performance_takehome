@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+from contextlib import contextmanager
 import os
 import random
 import unittest
@@ -48,6 +49,17 @@ class KernelBuilder:
         self.labels = {}
         self.fixups = []
         self.sched_diag = None
+        self.tag_enabled = os.getenv("TAG_DIAG", "0") == "1"
+        self._tag = None
+
+    @contextmanager
+    def tag_scope(self, name):
+        old = self._tag
+        self._tag = name
+        try:
+            yield
+        finally:
+            self._tag = old
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -59,8 +71,12 @@ class KernelBuilder:
             instrs.append({engine: [slot]})
         return instrs
 
-    def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+    def add(self, engine, slot, tag=None):
+        bundle = {engine: [slot]}
+        tag_name = tag if tag is not None else self._tag
+        if self.tag_enabled and tag_name:
+            bundle.setdefault("debug", []).append(("tag", tag_name, engine))
+        self.instrs.append(bundle)
 
     def label(self, name):
         self.labels[name] = len(self.instrs)
@@ -103,7 +119,7 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def emit_cycle(self, slots: list[tuple[Engine, tuple]]):
+    def emit_cycle(self, slots: list[tuple[Engine, tuple]], tag=None):
         if not slots:
             return
         bundle = defaultdict(list)
@@ -112,6 +128,9 @@ class KernelBuilder:
             counts[engine] += 1
             assert counts[engine] <= SLOT_LIMITS[engine], f"{engine} slots exceeded"
             bundle[engine].append(slot)
+            tag_name = tag if tag is not None else self._tag
+            if self.tag_enabled and tag_name and engine != "debug":
+                bundle["debug"].append(("tag", tag_name, engine))
         self.instrs.append(dict(bundle))
 
     def emit_vbroadcasts(self, pairs: list[tuple[int, int]]):
@@ -204,50 +223,89 @@ class KernelBuilder:
     def schedule_wave(self, ops_by_block: list[list[tuple[Engine, tuple]]], rr_start=0):
         n_blocks = len(ops_by_block)
         rr = rr_start % n_blocks if n_blocks else 0
-        window = int(os.getenv("SCHED_WINDOW", "4"))
+        rr_mode = os.getenv("SCHED_RR_MODE", "round_robin")
+        rr_load = rr
+        load_chunk_cycles = int(os.getenv("SCHED_LOAD_CHUNK_CYCLES", "2"))
+        if load_chunk_cycles < 1:
+            load_chunk_cycles = 1
+        load_chunk_count = 0
+        window = int(os.getenv("SCHED_WINDOW", "2"))
+        allow_multi = os.getenv("SCHED_MULTI_ISSUE", "1") == "1"
+        resource_first = os.getenv("SCHED_RESOURCE_FIRST", "1") == "1"
         for b in range(n_blocks):
             ops = ops_by_block[b]
-            if ops and len(ops[0]) != 3:
-                ops_by_block[b] = [
-                    (i, engine, slot) for i, (engine, slot) in enumerate(ops)
-                ]
+            if not ops:
+                continue
+            first_len = len(ops[0])
+            if first_len in (2, 3):
+                normalized = []
+                for i, item in enumerate(ops):
+                    if len(item) == 2:
+                        engine, slot = item
+                        normalized.append((i, engine, slot, None))
+                    else:
+                        if isinstance(item[0], int):
+                            seq, engine, slot = item
+                            normalized.append((seq, engine, slot, None))
+                        else:
+                            engine, slot, tag = item
+                            normalized.append((i, engine, slot, tag))
+                ops_by_block[b] = normalized
+            elif first_len == 4:
+                continue
         diag_enabled = os.getenv("SCHED_DIAG", "0") == "1"
         if diag_enabled and self.sched_diag is None:
             self.sched_diag = {
                 "cycles": 0,
                 "no_candidate": defaultdict(int),
                 "rejects": defaultdict(int),
+                "ready": defaultdict(int),
+                "issued": defaultdict(int),
+                "underfill_ready": defaultdict(int),
             }
 
         remaining_slots = defaultdict(int)
         for ops in ops_by_block:
-            for _seq, engine, _slot in ops:
+            for _seq, engine, _slot, _tag in ops:
                 remaining_slots[engine] += 1
         while any(ops_by_block[b] for b in range(n_blocks)):
             bundle = defaultdict(list)
             counts = defaultdict(int)
-            block_used = [False] * n_blocks
+            block_issues = [0] * n_blocks
             block_single = [False] * n_blocks
             block_sched = [[] for _ in range(n_blocks)]
-            priority = sorted(
-                [
+            if resource_first:
+                engine_order = ["load", "valu", "alu", "store", "flow"]
+                priority = [
                     e
-                    for e in SLOT_LIMITS.keys()
-                    if e != "debug" and remaining_slots.get(e, 0) > 0
-                ],
-                key=lambda e: remaining_slots.get(e, 0) / SLOT_LIMITS[e],
-                reverse=True,
-            )
+                    for e in engine_order
+                    if e in SLOT_LIMITS and remaining_slots.get(e, 0) > 0
+                ]
+            else:
+                priority = sorted(
+                    [
+                        e
+                        for e in SLOT_LIMITS.keys()
+                        if e != "debug" and remaining_slots.get(e, 0) > 0
+                    ],
+                    key=lambda e: remaining_slots.get(e, 0) / SLOT_LIMITS[e],
+                    reverse=True,
+                )
             for engine in priority:
                 limit = SLOT_LIMITS[engine]
                 while counts[engine] < limit:
                     scheduled_any = False
                     for bi in range(n_blocks):
-                        b = (rr + bi) % n_blocks
+                        rr_engine = rr
+                        if engine == "load" and rr_mode in ("sticky_load", "chunked_load"):
+                            rr_engine = rr_load
+                        b = (rr_engine + bi) % n_blocks
                         ops = ops_by_block[b]
                         if not ops:
                             continue
-                        if block_single[b] and block_used[b]:
+                        if block_single[b] and block_issues[b]:
+                            continue
+                        if not allow_multi and block_issues[b]:
                             continue
 
                         prior_reads = set()
@@ -257,12 +315,12 @@ class KernelBuilder:
                         chosen_writes = None
                         chosen_unknown = False
 
-                        for oi, (seq, op_engine, slot) in enumerate(ops[:window]):
+                        for oi, (seq, op_engine, slot, tag) in enumerate(ops[:window]):
                             reads, writes = self._slot_reads_writes(op_engine, slot)
                             if reads is None or writes is None:
                                 # Unknown slot shape; treat as a barrier.
-                                if oi == 0 and not block_used[b] and op_engine == engine:
-                                    chosen = (seq, op_engine, slot, oi)
+                                if oi == 0 and not block_issues[b] and op_engine == engine:
+                                    chosen = (seq, op_engine, slot, oi, tag)
                                     chosen_unknown = True
                                 elif diag_enabled and op_engine == engine:
                                     self.sched_diag["rejects"]["barrier"] += 1
@@ -301,7 +359,7 @@ class KernelBuilder:
                                 prior_writes.update(writes)
                                 continue
 
-                            chosen = (seq, op_engine, slot, oi)
+                            chosen = (seq, op_engine, slot, oi, tag)
                             chosen_reads = reads
                             chosen_writes = writes
                             break
@@ -309,15 +367,17 @@ class KernelBuilder:
                         if chosen is None:
                             continue
 
-                        seq, op_engine, slot, oi = chosen
+                        seq, op_engine, slot, oi, tag = chosen
                         bundle[op_engine].append(slot)
+                        if self.tag_enabled and tag:
+                            bundle["debug"].append(("tag", tag, op_engine))
                         counts[op_engine] += 1
                         remaining_slots[op_engine] -= 1
                         if chosen_unknown:
                             block_single[b] = True
                         elif chosen_reads is not None and chosen_writes is not None:
                             block_sched[b].append((seq, chosen_reads, chosen_writes))
-                        block_used[b] = True
+                        block_issues[b] += 1
                         ops.pop(oi)
                         scheduled_any = True
                         if counts[engine] >= limit:
@@ -327,11 +387,79 @@ class KernelBuilder:
                         break
                 if diag_enabled and counts[engine] < limit and remaining_slots.get(engine, 0) > 0:
                     self.sched_diag["no_candidate"][engine] += (limit - counts[engine])
+                if diag_enabled:
+                    ready = 0
+                    for b in range(n_blocks):
+                        if not ops_by_block[b]:
+                            continue
+                        if block_single[b] and block_issues[b]:
+                            continue
+                        if not allow_multi and block_issues[b]:
+                            continue
+                        ops = ops_by_block[b]
+                        prior_reads = set()
+                        prior_writes = set()
+                        local_sched = list(block_sched[b])
+                        for oi, (seq, op_engine, slot, _tag) in enumerate(ops[:window]):
+                            reads, writes = self._slot_reads_writes(op_engine, slot)
+                            if reads is None or writes is None:
+                                if oi == 0 and not block_issues[b] and op_engine == engine:
+                                    ready += 1
+                                break
+                            if reads & prior_writes or writes & prior_writes:
+                                prior_reads.update(reads)
+                                prior_writes.update(writes)
+                                continue
+                            if op_engine != engine:
+                                prior_reads.update(reads)
+                                prior_writes.update(writes)
+                                continue
+                            conflict = False
+                            for sched_seq, sched_reads, sched_writes in local_sched:
+                                if writes & sched_writes:
+                                    conflict = True
+                                    break
+                                if reads & sched_writes and sched_seq < seq:
+                                    conflict = True
+                                    break
+                            if conflict:
+                                prior_reads.update(reads)
+                                prior_writes.update(writes)
+                                continue
+                            ready += 1
+                            if not allow_multi:
+                                break
+                            local_sched.append((seq, reads, writes))
+                            prior_reads.update(reads)
+                            prior_writes.update(writes)
+                    self.sched_diag["ready"][engine] += ready
+                    self.sched_diag["issued"][engine] += counts[engine]
+                    if ready > counts[engine] and counts[engine] < limit:
+                        self.sched_diag["underfill_ready"][engine] += (
+                            min(limit, ready) - counts[engine]
+                        )
 
             if not bundle:
                 break
             self.instrs.append(dict(bundle))
-            rr = (rr + 1) % n_blocks
+            if n_blocks:
+                rr = (rr + 1) % n_blocks
+                if rr_mode == "round_robin":
+                    rr_load = rr
+                else:
+                    load_issued = counts.get("load", 0) > 0
+                    if rr_mode == "sticky_load":
+                        if not load_issued:
+                            rr_load = (rr_load + 1) % n_blocks
+                    elif rr_mode == "chunked_load":
+                        if load_issued:
+                            load_chunk_count += 1
+                            if load_chunk_count >= load_chunk_cycles:
+                                rr_load = (rr_load + 1) % n_blocks
+                                load_chunk_count = 0
+                        else:
+                            rr_load = (rr_load + 1) % n_blocks
+                            load_chunk_count = 0
             if diag_enabled:
                 self.sched_diag["cycles"] += 1
 
@@ -427,12 +555,22 @@ class KernelBuilder:
                 vbroadcasts.append((v_c3, c3))
                 hash_plan.append(("normal", op1, v_c1, op2, op3, v_c3))
 
-        self.emit_vbroadcasts(vbroadcasts)
+        with self.tag_scope("preamble:vbroadcast"):
+            self.emit_vbroadcasts(vbroadcasts)
         hash_scalar_consts = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             c1 = self.scratch_const(val1)
             c3 = self.scratch_const(val3)
             hash_scalar_consts.append((op1, c1, op2, op3, c3))
+
+        use_flow_select = os.getenv("USE_FLOW_SELECT", "0") == "1"
+        flow_select_depth1 = os.getenv("FLOW_SELECT_DEPTH1", "1") == "1"
+        flow_select_depth2 = os.getenv("FLOW_SELECT_DEPTH2", "0") == "1"
+        if use_flow_select:
+            flow_select_depth1 = True
+            flow_select_depth2 = True
+        fast_depth2_select = os.getenv("FAST_DEPTH2_SELECT", "1") != "0"
+        fast_depth3_select = os.getenv("FAST_DEPTH3_SELECT", "1") != "0"
 
         use_shallow_grouping = os.getenv("USE_SHALLOW_GROUPING", "1") != "0"
         shallow_group_depth = int(os.getenv("SHALLOW_GROUP_DEPTH", "2"))
@@ -445,6 +583,22 @@ class KernelBuilder:
         v_depth2_diff10 = None
         v_depth2_diff20 = None
         v_depth2_diff30 = None
+        v_depth3_diff10 = None
+        v_depth3_diff20 = None
+        v_depth3_diff30 = None
+        v_depth3_diff40 = None
+        v_depth3_diff50 = None
+        v_depth3_diff60 = None
+        v_depth3_diff70 = None
+        need_node_off = False
+        if use_shallow_grouping:
+            if shallow_group_depth >= 2 and not (flow_select_depth2 or fast_depth2_select):
+                need_node_off = True
+            if shallow_group_depth >= 3 and not fast_depth3_select:
+                need_node_off = True
+            if shallow_group_depth >= 4:
+                need_node_off = True
+
         if use_shallow_grouping:
             max_group_node = (1 << (shallow_group_depth + 1)) - 2
             total_group_nodes = sum(1 << d for d in range(shallow_group_depth + 1))
@@ -459,35 +613,38 @@ class KernelBuilder:
             for depth in range(shallow_group_depth + 1):
                 depth_offsets.append(offset)
                 offset += (1 << depth) * VLEN
-            v_node_off_all = self.alloc_scratch(
-                "v_node_off_all", total_group_nodes * VLEN
-            )
+            if need_node_off:
+                v_node_off_all = self.alloc_scratch(
+                    "v_node_off_all", total_group_nodes * VLEN
+                )
             v_node_val_all = self.alloc_scratch(
                 "v_node_val_all", total_group_nodes * VLEN
             )
             addr_ops = []
-            for node_idx in range(max_group_node + 1):
-                addr_ops.append(
-                    (
-                        "alu",
+            with self.tag_scope("preamble:group_addr"):
+                for node_idx in range(max_group_node + 1):
+                    addr_ops.append(
                         (
-                            "+",
-                            node_addr_s[node_idx],
-                            self.scratch["forest_values_p"],
-                            node_idx_consts[node_idx],
-                        ),
+                            "alu",
+                            (
+                                "+",
+                                node_addr_s[node_idx],
+                                self.scratch["forest_values_p"],
+                                node_idx_consts[node_idx],
+                            ),
+                        )
                     )
-                )
-                if len(addr_ops) == SLOT_LIMITS["alu"]:
+                    if len(addr_ops) == SLOT_LIMITS["alu"]:
+                        self.emit_cycle(addr_ops)
+                        addr_ops = []
+                if addr_ops:
                     self.emit_cycle(addr_ops)
-                    addr_ops = []
-            if addr_ops:
-                self.emit_cycle(addr_ops)
-            for i in range(0, max_group_node + 1, SLOT_LIMITS["load"]):
-                slots = []
-                for j in range(i, min(max_group_node + 1, i + SLOT_LIMITS["load"])):
-                    slots.append(("load", ("load", node_vals_s[j], node_addr_s[j])))
-                self.emit_cycle(slots)
+            with self.tag_scope("preamble:group_load"):
+                for i in range(0, max_group_node + 1, SLOT_LIMITS["load"]):
+                    slots = []
+                    for j in range(i, min(max_group_node + 1, i + SLOT_LIMITS["load"])):
+                        slots.append(("load", ("load", node_vals_s[j], node_addr_s[j])))
+                    self.emit_cycle(slots)
             idx_pairs = []
             val_pairs = []
             for depth in range(shallow_group_depth + 1):
@@ -496,20 +653,24 @@ class KernelBuilder:
                 depth_off = depth_offsets[depth]
                 for node_k in range(num_nodes):
                     node_idx = base + node_k
-                    idx_pairs.append(
-                        (
-                            v_node_off_all + depth_off + node_k * VLEN,
-                            node_idx_consts[node_k],
+                    if need_node_off:
+                        idx_pairs.append(
+                            (
+                                v_node_off_all + depth_off + node_k * VLEN,
+                                node_idx_consts[node_k],
+                            )
                         )
-                    )
                     val_pairs.append(
                         (
                             v_node_val_all + depth_off + node_k * VLEN,
                             node_vals_s[node_idx],
                         )
                     )
-            self.emit_vbroadcasts(idx_pairs)
-            self.emit_vbroadcasts(val_pairs)
+            if idx_pairs:
+                with self.tag_scope("preamble:group_broadcast"):
+                    self.emit_vbroadcasts(idx_pairs)
+            with self.tag_scope("preamble:group_broadcast"):
+                self.emit_vbroadcasts(val_pairs)
             diff_ops = []
             if shallow_group_depth >= 1:
                 diff1_s = self.alloc_scratch("diff1_s")
@@ -541,22 +702,86 @@ class KernelBuilder:
                         ),
                     ]
                 )
+            if shallow_group_depth >= 3:
+                base3 = (1 << 3) - 1
+                diff3_10_s = self.alloc_scratch("diff3_10_s")
+                diff3_20_s = self.alloc_scratch("diff3_20_s")
+                diff3_30_s = self.alloc_scratch("diff3_30_s")
+                diff3_40_s = self.alloc_scratch("diff3_40_s")
+                diff3_50_s = self.alloc_scratch("diff3_50_s")
+                diff3_60_s = self.alloc_scratch("diff3_60_s")
+                diff3_70_s = self.alloc_scratch("diff3_70_s")
+                diff_ops.extend(
+                    [
+                        (
+                            "alu",
+                            ("-", diff3_10_s, node_vals_s[base3 + 1], node_vals_s[base3 + 0]),
+                        ),
+                        (
+                            "alu",
+                            ("-", diff3_20_s, node_vals_s[base3 + 2], node_vals_s[base3 + 0]),
+                        ),
+                        (
+                            "alu",
+                            ("-", diff3_30_s, node_vals_s[base3 + 3], node_vals_s[base3 + 0]),
+                        ),
+                        (
+                            "alu",
+                            ("-", diff3_40_s, node_vals_s[base3 + 4], node_vals_s[base3 + 0]),
+                        ),
+                        (
+                            "alu",
+                            ("-", diff3_50_s, node_vals_s[base3 + 5], node_vals_s[base3 + 0]),
+                        ),
+                        (
+                            "alu",
+                            ("-", diff3_60_s, node_vals_s[base3 + 6], node_vals_s[base3 + 0]),
+                        ),
+                        (
+                            "alu",
+                            ("-", diff3_70_s, node_vals_s[base3 + 7], node_vals_s[base3 + 0]),
+                        ),
+                    ]
+                )
             if diff_ops:
-                self.emit_cycle(diff_ops)
+                with self.tag_scope("preamble:group_diff"):
+                    self.emit_cycle(diff_ops)
             if shallow_group_depth >= 1:
                 v_depth1_diff = self.alloc_scratch("v_depth1_diff", VLEN)
-                self.emit_cycle([("valu", ("vbroadcast", v_depth1_diff, diff1_s))])
+                with self.tag_scope("preamble:group_diff"):
+                    self.emit_cycle([("valu", ("vbroadcast", v_depth1_diff, diff1_s))])
             if shallow_group_depth >= 2:
                 v_depth2_diff10 = self.alloc_scratch("v_depth2_diff10", VLEN)
                 v_depth2_diff20 = self.alloc_scratch("v_depth2_diff20", VLEN)
                 v_depth2_diff30 = self.alloc_scratch("v_depth2_diff30", VLEN)
-                self.emit_vbroadcasts(
-                    [
-                        (v_depth2_diff10, diff2_10_s),
-                        (v_depth2_diff20, diff2_20_s),
-                        (v_depth2_diff30, diff2_30_s),
-                    ]
-                )
+                with self.tag_scope("preamble:group_diff"):
+                    self.emit_vbroadcasts(
+                        [
+                            (v_depth2_diff10, diff2_10_s),
+                            (v_depth2_diff20, diff2_20_s),
+                            (v_depth2_diff30, diff2_30_s),
+                        ]
+                    )
+            if shallow_group_depth >= 3:
+                v_depth3_diff10 = self.alloc_scratch("v_depth3_diff10", VLEN)
+                v_depth3_diff20 = self.alloc_scratch("v_depth3_diff20", VLEN)
+                v_depth3_diff30 = self.alloc_scratch("v_depth3_diff30", VLEN)
+                v_depth3_diff40 = self.alloc_scratch("v_depth3_diff40", VLEN)
+                v_depth3_diff50 = self.alloc_scratch("v_depth3_diff50", VLEN)
+                v_depth3_diff60 = self.alloc_scratch("v_depth3_diff60", VLEN)
+                v_depth3_diff70 = self.alloc_scratch("v_depth3_diff70", VLEN)
+                with self.tag_scope("preamble:group_diff"):
+                    self.emit_vbroadcasts(
+                        [
+                            (v_depth3_diff10, diff3_10_s),
+                            (v_depth3_diff20, diff3_20_s),
+                            (v_depth3_diff30, diff3_30_s),
+                            (v_depth3_diff40, diff3_40_s),
+                            (v_depth3_diff50, diff3_50_s),
+                            (v_depth3_diff60, diff3_60_s),
+                            (v_depth3_diff70, diff3_70_s),
+                        ]
+                    )
 
         # Precompute per-depth base pointers for offset indexing on non-grouped depths.
         base_ptrs = [None] * (forest_height + 1)
@@ -570,8 +795,9 @@ class KernelBuilder:
                 ("alu", ("+", base_ptr, self.scratch["forest_values_p"], base_idx_const))
             )
             base_ptrs[depth] = base_ptr
-        for i in range(0, len(base_ptr_ops), SLOT_LIMITS["alu"]):
-            self.emit_cycle(base_ptr_ops[i : i + SLOT_LIMITS["alu"]])
+        with self.tag_scope("preamble:base_ptr"):
+            for i in range(0, len(base_ptr_ops), SLOT_LIMITS["alu"]):
+                self.emit_cycle(base_ptr_ops[i : i + SLOT_LIMITS["alu"]])
 
         idx_addr = self.alloc_scratch("idx_addr")
         val_addr = self.alloc_scratch("val_addr")
@@ -887,13 +1113,7 @@ class KernelBuilder:
         if start_depth:
             start_base_idx_const = self.scratch_const((1 << start_depth) - 1)
 
-        use_flow_select = os.getenv("USE_FLOW_SELECT", "0") == "1"
-        flow_select_depth1 = os.getenv("FLOW_SELECT_DEPTH1", "1") == "1"
-        flow_select_depth2 = os.getenv("FLOW_SELECT_DEPTH2", "0") == "1"
-        if use_flow_select:
-            flow_select_depth1 = True
-            flow_select_depth2 = True
-        fast_depth2_select = os.getenv("FAST_DEPTH2_SELECT", "1") != "0"
+        interleave_addr_load = os.getenv("INTERLEAVE_ADDR_LOAD", "0") == "1"
         wave_size = int(os.getenv("WAVE_SIZE", "468"))
         num_tmp = 3 if flow_select_depth2 else 2
         max_wave = (SCRATCH_SIZE - self.scratch_ptr) // (VLEN * num_tmp)
@@ -943,44 +1163,43 @@ class KernelBuilder:
                 idx_vec = idx_all + block_idx * VLEN
                 val_vec = val_all + block_idx * VLEN
                 ops = []
+                def add_op(engine, slot, tag):
+                    ops.append((engine, slot, tag))
                 if not partition_grouping:
                     off_const = block_offsets[block_idx]
-                    ops.extend(
-                        [
-                            (
-                                "alu",
-                                (
-                                    "+",
-                                    idx_addr_b[block_idx],
-                                    self.scratch["inp_indices_p"],
-                                    off_const,
-                                ),
-                            ),
-                            (
-                                "alu",
-                                (
-                                    "+",
-                                    val_addr_b[block_idx],
-                                    self.scratch["inp_values_p"],
-                                    off_const,
-                                ),
-                            ),
-                            ("load", ("vload", idx_vec, idx_addr_b[block_idx])),
-                            ("load", ("vload", val_vec, val_addr_b[block_idx])),
-                        ]
+                    add_op(
+                        "alu",
+                        (
+                            "+",
+                            idx_addr_b[block_idx],
+                            self.scratch["inp_indices_p"],
+                            off_const,
+                        ),
+                        "init:addr",
                     )
+                    add_op(
+                        "alu",
+                        (
+                            "+",
+                            val_addr_b[block_idx],
+                            self.scratch["inp_values_p"],
+                            off_const,
+                        ),
+                        "init:addr",
+                    )
+                    add_op("load", ("vload", idx_vec, idx_addr_b[block_idx]), "init:vload")
+                    add_op("load", ("vload", val_vec, val_addr_b[block_idx]), "init:vload")
                 if start_base_idx_const is not None:
                     for lane in range(VLEN):
-                        ops.append(
+                        add_op(
+                            "alu",
                             (
-                                "alu",
-                                (
-                                    "-",
-                                    idx_vec + lane,
-                                    idx_vec + lane,
-                                    start_base_idx_const,
-                                ),
-                            )
+                                "-",
+                                idx_vec + lane,
+                                idx_vec + lane,
+                                start_base_idx_const,
+                            ),
+                            "idx:base_off",
                         )
                 for (depth, use_grouping_round, num_nodes, depth_offset) in round_plans:
                     node_val_src = None
@@ -990,79 +1209,78 @@ class KernelBuilder:
                         elif depth == 1:
                             if flow_select_depth1:
                                 # off is 0/1; use it directly as mask
-                                ops.append(
+                                add_op(
+                                    "flow",
                                     (
-                                        "flow",
-                                        (
-                                            "vselect",
-                                            tmp2_vec_b[bi],
-                                            idx_vec,
-                                            v_node_val_all + depth_offset + VLEN,
-                                            v_node_val_all + depth_offset,
-                                        ),
-                                    )
+                                        "vselect",
+                                        tmp2_vec_b[bi],
+                                        idx_vec,
+                                        v_node_val_all + depth_offset + VLEN,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d1",
                                 )
                             else:
-                                ops.append(
+                                add_op(
+                                    "valu",
                                     (
-                                        "valu",
-                                        (
-                                            "multiply_add",
-                                            tmp2_vec_b[bi],
-                                            idx_vec,
-                                            v_depth1_diff,
-                                            v_node_val_all + depth_offset,
-                                        ),
-                                    )
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        idx_vec,
+                                        v_depth1_diff,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d1",
                                 )
                             node_val_src = tmp2_vec_b[bi]
                         else:
                             if flow_select_depth2 and depth == 2:
                                 # b0 = off & 1, b1 = off >> 1
-                                ops.append(
-                                    ("valu", ("&", tmp1_vec_b[bi], idx_vec, v_one))
+                                add_op(
+                                    "valu",
+                                    ("&", tmp1_vec_b[bi], idx_vec, v_one),
+                                    "group:d2",
                                 )
-                                ops.append(
-                                    ("valu", (">>", tmp2_vec_b[bi], idx_vec, v_one))
+                                add_op(
+                                    "valu",
+                                    (">>", tmp2_vec_b[bi], idx_vec, v_one),
+                                    "group:d2",
                                 )
                                 # left = select(node1, node0) by b0
-                                ops.append(
+                                add_op(
+                                    "flow",
                                     (
-                                        "flow",
-                                        (
-                                            "vselect",
-                                            tmp3_vec_b[bi],
-                                            tmp1_vec_b[bi],
-                                            v_node_val_all + depth_offset + VLEN,
-                                            v_node_val_all + depth_offset,
-                                        ),
-                                    )
+                                        "vselect",
+                                        tmp3_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_node_val_all + depth_offset + VLEN,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d2",
                                 )
                                 # right = select(node3, node2) by b0
-                                ops.append(
+                                add_op(
+                                    "flow",
                                     (
-                                        "flow",
-                                        (
-                                            "vselect",
-                                            tmp1_vec_b[bi],
-                                            tmp1_vec_b[bi],
-                                            v_node_val_all + depth_offset + 3 * VLEN,
-                                            v_node_val_all + depth_offset + 2 * VLEN,
-                                        ),
-                                    )
+                                        "vselect",
+                                        tmp1_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_node_val_all + depth_offset + 3 * VLEN,
+                                        v_node_val_all + depth_offset + 2 * VLEN,
+                                    ),
+                                    "group:d2",
                                 )
                                 # node_val = select(right, left) by b1
-                                ops.append(
+                                add_op(
+                                    "flow",
                                     (
-                                        "flow",
-                                        (
-                                            "vselect",
-                                            tmp2_vec_b[bi],
-                                            tmp2_vec_b[bi],
-                                            tmp1_vec_b[bi],
-                                            tmp3_vec_b[bi],
-                                        ),
-                                    )
+                                        "vselect",
+                                        tmp2_vec_b[bi],
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                    ),
+                                    "group:d2",
                                 )
                                 node_val_src = tmp2_vec_b[bi]
                             elif (
@@ -1071,113 +1289,180 @@ class KernelBuilder:
                                 and v_depth2_diff10 is not None
                             ):
                                 # Start from node0, then add diffs for the other nodes.
-                                ops.append(
+                                add_op(
+                                    "valu",
+                                    ("==", tmp1_vec_b[bi], idx_vec, v_one),
+                                    "group:d2",
+                                )
+                                add_op(
+                                    "valu",
                                     (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_depth2_diff10,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d2",
+                                )
+                                add_op(
+                                    "valu",
+                                    ("==", tmp1_vec_b[bi], idx_vec, v_two),
+                                    "group:d2",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_depth2_diff20,
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d2",
+                                )
+                                add_op(
+                                    "valu",
+                                    ("==", tmp1_vec_b[bi], idx_vec, v_three),
+                                    "group:d2",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_depth2_diff30,
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d2",
+                                )
+                                node_val_src = tmp2_vec_b[bi]
+                            elif (
+                                depth == 3
+                                and fast_depth3_select
+                                and v_depth3_diff10 is not None
+                            ):
+                                # Start from node0, then add diffs for the other nodes.
+                                add_op(
+                                    "valu",
+                                    ("==", tmp1_vec_b[bi], idx_vec, v_one),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_depth3_diff10,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    ("==", tmp1_vec_b[bi], idx_vec, v_two),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_depth3_diff20,
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    ("==", tmp1_vec_b[bi], idx_vec, v_three),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_depth3_diff30,
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                for const_idx, diff_vec in (
+                                    (4, v_depth3_diff40),
+                                    (5, v_depth3_diff50),
+                                    (6, v_depth3_diff60),
+                                    (7, v_depth3_diff70),
+                                ):
+                                    add_op(
                                         "valu",
                                         (
-                                            "==",
+                                            "vbroadcast",
                                             tmp1_vec_b[bi],
-                                            idx_vec,
-                                            v_one,
+                                            node_idx_consts[const_idx],
                                         ),
+                                        "group:d3",
                                     )
-                                )
-                                ops.append(
-                                    (
+                                    add_op(
+                                        "valu",
+                                        ("==", tmp1_vec_b[bi], idx_vec, tmp1_vec_b[bi]),
+                                        "group:d3",
+                                    )
+                                    add_op(
                                         "valu",
                                         (
                                             "multiply_add",
                                             tmp2_vec_b[bi],
                                             tmp1_vec_b[bi],
-                                            v_depth2_diff10,
-                                            v_node_val_all + depth_offset,
-                                        ),
-                                    )
-                                )
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "==",
-                                            tmp1_vec_b[bi],
-                                            idx_vec,
-                                            v_two,
-                                        ),
-                                    )
-                                )
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "multiply_add",
-                                            tmp2_vec_b[bi],
-                                            tmp1_vec_b[bi],
-                                            v_depth2_diff20,
+                                            diff_vec,
                                             tmp2_vec_b[bi],
                                         ),
+                                        "group:d3",
                                     )
-                                )
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "==",
-                                            tmp1_vec_b[bi],
-                                            idx_vec,
-                                            v_three,
-                                        ),
-                                    )
-                                )
-                                ops.append(
-                                    (
-                                        "valu",
-                                        (
-                                            "multiply_add",
-                                            tmp2_vec_b[bi],
-                                            tmp1_vec_b[bi],
-                                            v_depth2_diff30,
-                                            tmp2_vec_b[bi],
-                                        ),
-                                    )
-                                )
                                 node_val_src = tmp2_vec_b[bi]
                             else:
                                 # tmp2_vec_b holds node_val accumulator
-                                ops.append(("valu", ("+", tmp2_vec_b[bi], v_zero, v_zero)))
+                                add_op(
+                                    "valu",
+                                    ("+", tmp2_vec_b[bi], v_zero, v_zero),
+                                    f"group:d{depth}",
+                                )
                                 for node_k in range(num_nodes):
-                                    ops.append(
+                                    add_op(
+                                        "valu",
                                         (
-                                            "valu",
-                                            (
-                                                "==",
-                                                tmp1_vec_b[bi],
-                                                idx_vec,
-                                                v_node_off_all
-                                                + depth_offset
-                                                + node_k * VLEN,
-                                            ),
-                                        )
+                                            "==",
+                                            tmp1_vec_b[bi],
+                                            idx_vec,
+                                            v_node_off_all
+                                            + depth_offset
+                                            + node_k * VLEN,
+                                        ),
+                                        f"group:d{depth}",
                                     )
-                                    ops.append(
+                                    add_op(
+                                        "valu",
                                         (
-                                            "valu",
-                                            (
-                                                "multiply_add",
-                                                tmp2_vec_b[bi],
-                                                tmp1_vec_b[bi],
-                                                v_node_val_all
-                                                + depth_offset
-                                                + node_k * VLEN,
-                                                tmp2_vec_b[bi],
-                                            ),
-                                        )
+                                            "multiply_add",
+                                            tmp2_vec_b[bi],
+                                            tmp1_vec_b[bi],
+                                            v_node_val_all
+                                            + depth_offset
+                                            + node_k * VLEN,
+                                            tmp2_vec_b[bi],
+                                        ),
+                                        f"group:d{depth}",
                                     )
                                 node_val_src = tmp2_vec_b[bi]
                     else:
                         base_ptr = base_ptrs[depth]
-                        for lane in range(VLEN):
-                            ops.append(
-                                (
+                        if interleave_addr_load:
+                            for lane in range(VLEN):
+                                add_op(
                                     "alu",
                                     (
                                         "+",
@@ -1185,47 +1470,63 @@ class KernelBuilder:
                                         idx_vec + lane,
                                         base_ptr,
                                     ),
+                                    "gather:addr",
                                 )
-                            )
-                        for lane in range(VLEN):
-                            ops.append(
-                                (
+                                add_op(
                                     "load",
                                     ("load_offset", tmp2_vec_b[bi], tmp1_vec_b[bi], lane),
+                                    "gather:load",
                                 )
-                            )
+                        else:
+                            for lane in range(VLEN):
+                                add_op(
+                                    "alu",
+                                    (
+                                        "+",
+                                        tmp1_vec_b[bi] + lane,
+                                        idx_vec + lane,
+                                        base_ptr,
+                                    ),
+                                    "gather:addr",
+                                )
+                            for lane in range(VLEN):
+                                add_op(
+                                    "load",
+                                    ("load_offset", tmp2_vec_b[bi], tmp1_vec_b[bi], lane),
+                                    "gather:load",
+                                )
                         node_val_src = tmp2_vec_b[bi]
-                    ops.append(("valu", ("^", val_vec, val_vec, node_val_src)))
+                    add_op("valu", ("^", val_vec, val_vec, node_val_src), "xor")
 
                     for entry in hash_plan:
                         if entry[0] == "fused":
                             _, v_mult, v_c1 = entry
-                            ops.append(
-                                ("valu", ("multiply_add", val_vec, val_vec, v_mult, v_c1))
+                            add_op(
+                                "valu",
+                                ("multiply_add", val_vec, val_vec, v_mult, v_c1),
+                                "hash",
                             )
                         else:
                             _, op1, v_c1, op2, op3, v_c3 = entry
-                            ops.append(("valu", (op1, tmp1_vec_b[bi], val_vec, v_c1)))
-                            ops.append(("valu", (op3, tmp2_vec_b[bi], val_vec, v_c3)))
-                            ops.append(
-                                ("valu", (op2, val_vec, tmp1_vec_b[bi], tmp2_vec_b[bi]))
+                            add_op("valu", (op1, tmp1_vec_b[bi], val_vec, v_c1), "hash")
+                            add_op("valu", (op3, tmp2_vec_b[bi], val_vec, v_c3), "hash")
+                            add_op(
+                                "valu", (op2, val_vec, tmp1_vec_b[bi], tmp2_vec_b[bi]), "hash"
                             )
 
                     if depth == forest_height:
-                        ops.append(("valu", ("+", idx_vec, v_zero, v_zero)))
+                        add_op("valu", ("+", idx_vec, v_zero, v_zero), "idx_reset")
                     else:
-                        ops.append(("valu", ("&", tmp1_vec_b[bi], val_vec, v_one)))
-                        ops.append(
-                            ("valu", ("multiply_add", idx_vec, idx_vec, v_two, tmp1_vec_b[bi]))
+                        add_op("valu", ("&", tmp1_vec_b[bi], val_vec, v_one), "idx_update")
+                        add_op(
+                            "valu",
+                            ("multiply_add", idx_vec, idx_vec, v_two, tmp1_vec_b[bi]),
+                            "idx_update",
                         )
 
                 if not partition_grouping:
-                    ops.extend(
-                        [
-                            ("store", ("vstore", idx_addr_b[block_idx], idx_vec)),
-                            ("store", ("vstore", val_addr_b[block_idx], val_vec)),
-                        ]
-                    )
+                    add_op("store", ("vstore", idx_addr_b[block_idx], idx_vec), "store_idx")
+                    add_op("store", ("vstore", val_addr_b[block_idx], val_vec), "store_val")
 
                 ops_by_block.append(ops)
 

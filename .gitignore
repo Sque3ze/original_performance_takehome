@@ -3,3 +3,4 @@ trace.json
 .hypothesis
 .DS_Store
 /tools
+results.jsonl
