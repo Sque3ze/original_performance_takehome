@@ -72,6 +72,21 @@ class KernelBuilder:
         return instrs
 
     def add(self, engine, slot, tag=None):
+        # Small, safe VLIW packing: only pack adjacent load-const ops.
+        if engine == "load" and slot and slot[0] == "const" and self.instrs:
+            last = self.instrs[-1]
+            if (
+                "load" in last
+                and set(last.keys()) <= {"load", "debug"}
+                and len(last["load"]) < SLOT_LIMITS["load"]
+                and all(isinstance(s, tuple) and s and s[0] == "const" for s in last["load"])
+            ):
+                last["load"].append(slot)
+                tag_name = tag if tag is not None else self._tag
+                if self.tag_enabled and tag_name:
+                    last.setdefault("debug", []).append(("tag", tag_name, engine))
+                return
+
         bundle = {engine: [slot]}
         tag_name = tag if tag is not None else self._tag
         if self.tag_enabled and tag_name:
@@ -232,6 +247,43 @@ class KernelBuilder:
         window = int(os.getenv("SCHED_WINDOW", "2"))
         allow_multi = os.getenv("SCHED_MULTI_ISSUE", "1") == "1"
         resource_first = os.getenv("SCHED_RESOURCE_FIRST", "1") == "1"
+        load_select = os.getenv("SCHED_LOAD_SELECT", "rr")
+        if load_select not in ("rr", "ready_first", "earliest", "tag_first"):
+            load_select = "rr"
+        load_tag_set = {
+            t.strip()
+            for t in os.getenv("SCHED_LOAD_TAGS", "gather:load").split(",")
+            if t.strip()
+        }
+        bubble_recovery = os.getenv("SCHED_BUBBLE_RECOVERY", "0") == "1"
+        bubble_cycles = int(os.getenv("SCHED_BUBBLE_RECOVERY_CYCLES", "4"))
+        if bubble_cycles < 1:
+            bubble_cycles = 1
+        bubble_engines = {
+            t.strip()
+            for t in os.getenv("SCHED_BUBBLE_RECOVERY_ENGINES", "alu,valu").split(",")
+            if t.strip()
+        }
+        bubble_tag_set = {
+            t.strip()
+            for t in os.getenv("SCHED_BUBBLE_TAGS", "gather:addr,gather:load").split(",")
+            if t.strip()
+        }
+        bubble_hold_rr = os.getenv("SCHED_BUBBLE_RECOVERY_HOLD_RR", "1") == "1"
+        bubble_budget = 0
+        enable_load_recovery = os.getenv("SCHED_LOAD_RECOVERY", "0") == "1"
+        recovery_cycles = int(os.getenv("SCHED_LOAD_RECOVERY_CYCLES", "2"))
+        if recovery_cycles < 1:
+            recovery_cycles = 1
+        recovery_engine = os.getenv("SCHED_LOAD_RECOVERY_ENGINE", "alu")
+        if recovery_engine not in ("alu", "valu"):
+            recovery_engine = "alu"
+        recovery_tags = {
+            t.strip()
+            for t in os.getenv("SCHED_LOAD_RECOVERY_TAGS", "gather:addr").split(",")
+            if t.strip()
+        }
+        recovery_budget = 0
         for b in range(n_blocks):
             ops = ops_by_block[b]
             if not ops:
@@ -264,6 +316,69 @@ class KernelBuilder:
                 "underfill_ready": defaultdict(int),
             }
 
+        def _choose_candidate(ops, engine, block_sched, block_issues):
+            prior_reads = set()
+            prior_writes = set()
+            chosen = None
+            chosen_reads = None
+            chosen_writes = None
+            chosen_unknown = False
+
+            for oi, (seq, op_engine, slot, tag) in enumerate(ops[:window]):
+                reads, writes = self._slot_reads_writes(op_engine, slot)
+                if reads is None or writes is None:
+                    # Unknown slot shape; treat as a barrier.
+                    if oi == 0 and not block_issues and op_engine == engine:
+                        chosen = (seq, op_engine, slot, oi, tag)
+                        chosen_unknown = True
+                    elif diag_enabled and op_engine == engine:
+                        self.sched_diag["rejects"]["barrier"] += 1
+                    break
+
+                # Can't move this op ahead of earlier unscheduled ops if it would
+                # violate RAW/WAW/WAR with those earlier ops.
+                if reads & prior_writes or writes & prior_writes or writes & prior_reads:
+                    if diag_enabled and op_engine == engine:
+                        if reads & prior_writes:
+                            self.sched_diag["rejects"]["raw"] += 1
+                        if writes & prior_writes:
+                            self.sched_diag["rejects"]["waw"] += 1
+                        if writes & prior_reads:
+                            self.sched_diag["rejects"]["war"] += 1
+                    prior_reads.update(reads)
+                    prior_writes.update(writes)
+                    continue
+
+                if op_engine != engine:
+                    prior_reads.update(reads)
+                    prior_writes.update(writes)
+                    continue
+
+                # Same-cycle hazards within the block.
+                conflict = False
+                for sched_seq, sched_reads, sched_writes in block_sched:
+                    if writes & sched_writes:
+                        conflict = True
+                        break
+                    if reads & sched_writes and sched_seq < seq:
+                        conflict = True
+                        break
+                if conflict:
+                    if diag_enabled and op_engine == engine:
+                        self.sched_diag["rejects"]["cycle_conflict"] += 1
+                    prior_reads.update(reads)
+                    prior_writes.update(writes)
+                    continue
+
+                chosen = (seq, op_engine, slot, oi, tag)
+                chosen_reads = reads
+                chosen_writes = writes
+                break
+
+            if chosen is None:
+                return None
+            return chosen, chosen_reads, chosen_writes, chosen_unknown
+
         remaining_slots = defaultdict(int)
         for ops in ops_by_block:
             for _seq, engine, _slot, _tag in ops:
@@ -274,6 +389,29 @@ class KernelBuilder:
             block_issues = [0] * n_blocks
             block_single = [False] * n_blocks
             block_sched = [[] for _ in range(n_blocks)]
+            bubble_active = bubble_recovery and bubble_budget > 0
+            bubble_order = None
+            if bubble_active and n_blocks:
+                block_load_dist = [10**9] * n_blocks
+                block_tag_dist = [10**9] * n_blocks
+                for b in range(n_blocks):
+                    ops = ops_by_block[b]
+                    if not ops:
+                        continue
+                    for oi, (_seq, op_engine, _slot, _tag) in enumerate(ops):
+                        if _tag in bubble_tag_set and block_tag_dist[b] == 10**9:
+                            block_tag_dist[b] = oi
+                        if op_engine == "load":
+                            block_load_dist[b] = oi
+                            break
+                bubble_order = sorted(
+                    [b for b in range(n_blocks) if ops_by_block[b]],
+                    key=lambda b: (
+                        block_tag_dist[b],
+                        block_load_dist[b],
+                        (b - rr) % n_blocks,
+                    ),
+                )
             if resource_first:
                 engine_order = ["load", "valu", "alu", "store", "flow"]
                 priority = [
@@ -291,97 +429,125 @@ class KernelBuilder:
                     key=lambda e: remaining_slots.get(e, 0) / SLOT_LIMITS[e],
                     reverse=True,
                 )
+            if enable_load_recovery and recovery_budget > 0 and recovery_engine in priority:
+                priority = [recovery_engine] + [e for e in priority if e != recovery_engine]
             for engine in priority:
                 limit = SLOT_LIMITS[engine]
                 while counts[engine] < limit:
                     scheduled_any = False
-                    for bi in range(n_blocks):
-                        rr_engine = rr
-                        if engine == "load" and rr_mode in ("sticky_load", "chunked_load"):
-                            rr_engine = rr_load
-                        b = (rr_engine + bi) % n_blocks
-                        ops = ops_by_block[b]
-                        if not ops:
-                            continue
-                        if block_single[b] and block_issues[b]:
-                            continue
-                        if not allow_multi and block_issues[b]:
-                            continue
+                    rr_engine = rr
+                    if engine == "load" and rr_mode in ("sticky_load", "chunked_load"):
+                        rr_engine = rr_load
 
-                        prior_reads = set()
-                        prior_writes = set()
-                        chosen = None
-                        chosen_reads = None
-                        chosen_writes = None
-                        chosen_unknown = False
+                    if engine == "load" and load_select != "rr":
+                        best_choice = None
+                        best_key = None
+                        found_front = False
+                        for bi in range(n_blocks):
+                            b = (rr_engine + bi) % n_blocks
+                            ops = ops_by_block[b]
+                            if not ops:
+                                continue
+                            if block_single[b] and block_issues[b]:
+                                continue
+                            if not allow_multi and block_issues[b]:
+                                continue
 
-                        for oi, (seq, op_engine, slot, tag) in enumerate(ops[:window]):
-                            reads, writes = self._slot_reads_writes(op_engine, slot)
-                            if reads is None or writes is None:
-                                # Unknown slot shape; treat as a barrier.
-                                if oi == 0 and not block_issues[b] and op_engine == engine:
-                                    chosen = (seq, op_engine, slot, oi, tag)
-                                    chosen_unknown = True
-                                elif diag_enabled and op_engine == engine:
-                                    self.sched_diag["rejects"]["barrier"] += 1
+                            cand = _choose_candidate(
+                                ops, engine, block_sched[b], block_issues[b]
+                            )
+                            if cand is None:
+                                continue
+                            chosen, chosen_reads, chosen_writes, chosen_unknown = cand
+                            oi = chosen[3]
+                            if load_select == "ready_first":
+                                if oi == 0:
+                                    if not found_front:
+                                        best_choice = (b, cand)
+                                        best_key = bi
+                                        found_front = True
+                                    continue
+                                if found_front:
+                                    continue
+                                if best_choice is None:
+                                    best_choice = (b, cand)
+                                    best_key = bi
+                            elif load_select == "tag_first":
+                                tag = chosen[4]
+                                key = (0 if tag in load_tag_set else 1, oi, bi)
+                                if best_key is None or key < best_key:
+                                    best_key = key
+                                    best_choice = (b, cand)
+                            else:
+                                key = (oi, bi)
+                                if best_key is None or key < best_key:
+                                    best_key = key
+                                    best_choice = (b, cand)
+
+                        if best_choice is not None:
+                            b, cand = best_choice
+                            chosen, chosen_reads, chosen_writes, chosen_unknown = cand
+                            seq, op_engine, slot, oi, tag = chosen
+                            bundle[op_engine].append(slot)
+                            if self.tag_enabled and tag:
+                                bundle["debug"].append(("tag", tag, op_engine))
+                            counts[op_engine] += 1
+                            remaining_slots[op_engine] -= 1
+                            if chosen_unknown:
+                                block_single[b] = True
+                            elif chosen_reads is not None and chosen_writes is not None:
+                                block_sched[b].append((seq, chosen_reads, chosen_writes))
+                            block_issues[b] += 1
+                            ops_by_block[b].pop(oi)
+                            scheduled_any = True
+                            if counts[engine] >= limit:
                                 break
-
-                            # Can't move this op ahead of earlier unscheduled ops if it would
-                            # violate RAW/WAW/WAR with those earlier ops.
-                            if reads & prior_writes or writes & prior_writes:
-                                if diag_enabled and op_engine == engine:
-                                    if reads & prior_writes:
-                                        self.sched_diag["rejects"]["raw"] += 1
-                                    if writes & prior_writes:
-                                        self.sched_diag["rejects"]["waw"] += 1
-                                prior_reads.update(reads)
-                                prior_writes.update(writes)
-                                continue
-
-                            if op_engine != engine:
-                                prior_reads.update(reads)
-                                prior_writes.update(writes)
-                                continue
-
-                            # Same-cycle hazards within the block.
-                            conflict = False
-                            for sched_seq, sched_reads, sched_writes in block_sched[b]:
-                                if writes & sched_writes:
-                                    conflict = True
-                                    break
-                                if reads & sched_writes and sched_seq < seq:
-                                    conflict = True
-                                    break
-                            if conflict:
-                                if diag_enabled and op_engine == engine:
-                                    self.sched_diag["rejects"]["cycle_conflict"] += 1
-                                prior_reads.update(reads)
-                                prior_writes.update(writes)
-                                continue
-
-                            chosen = (seq, op_engine, slot, oi, tag)
-                            chosen_reads = reads
-                            chosen_writes = writes
+                        if not scheduled_any:
                             break
+                    else:
+                        if bubble_active and bubble_order is not None and engine in bubble_engines:
+                            block_iter = bubble_order
+                        else:
+                            block_iter = ((rr_engine + bi) % n_blocks for bi in range(n_blocks))
+                        for b in block_iter:
+                            ops = ops_by_block[b]
+                            if not ops:
+                                continue
+                            if block_single[b] and block_issues[b]:
+                                continue
+                            if not allow_multi and block_issues[b]:
+                                continue
 
-                        if chosen is None:
-                            continue
+                            cand = _choose_candidate(
+                                ops, engine, block_sched[b], block_issues[b]
+                            )
+                            if cand is None:
+                                continue
+                            if (
+                                enable_load_recovery
+                                and recovery_budget > 0
+                                and engine == recovery_engine
+                            ):
+                                tag = cand[0][4]
+                                if tag not in recovery_tags:
+                                    continue
 
-                        seq, op_engine, slot, oi, tag = chosen
-                        bundle[op_engine].append(slot)
-                        if self.tag_enabled and tag:
-                            bundle["debug"].append(("tag", tag, op_engine))
-                        counts[op_engine] += 1
-                        remaining_slots[op_engine] -= 1
-                        if chosen_unknown:
-                            block_single[b] = True
-                        elif chosen_reads is not None and chosen_writes is not None:
-                            block_sched[b].append((seq, chosen_reads, chosen_writes))
-                        block_issues[b] += 1
-                        ops.pop(oi)
-                        scheduled_any = True
-                        if counts[engine] >= limit:
-                            break
+                            chosen, chosen_reads, chosen_writes, chosen_unknown = cand
+                            seq, op_engine, slot, oi, tag = chosen
+                            bundle[op_engine].append(slot)
+                            if self.tag_enabled and tag:
+                                bundle["debug"].append(("tag", tag, op_engine))
+                            counts[op_engine] += 1
+                            remaining_slots[op_engine] -= 1
+                            if chosen_unknown:
+                                block_single[b] = True
+                            elif chosen_reads is not None and chosen_writes is not None:
+                                block_sched[b].append((seq, chosen_reads, chosen_writes))
+                            block_issues[b] += 1
+                            ops.pop(oi)
+                            scheduled_any = True
+                            if counts[engine] >= limit:
+                                break
 
                     if not scheduled_any:
                         break
@@ -406,7 +572,11 @@ class KernelBuilder:
                                 if oi == 0 and not block_issues[b] and op_engine == engine:
                                     ready += 1
                                 break
-                            if reads & prior_writes or writes & prior_writes:
+                            if (
+                                reads & prior_writes
+                                or writes & prior_writes
+                                or writes & prior_reads
+                            ):
                                 prior_reads.update(reads)
                                 prior_writes.update(writes)
                                 continue
@@ -439,11 +609,24 @@ class KernelBuilder:
                             min(limit, ready) - counts[engine]
                         )
 
+            if enable_load_recovery and counts.get("load", 0) < SLOT_LIMITS["load"]:
+                recovery_budget = recovery_cycles
+            elif recovery_budget > 0:
+                recovery_budget -= 1
+            if bubble_recovery and remaining_slots.get("load", 0) > 0:
+                if counts.get("load", 0) < SLOT_LIMITS["load"]:
+                    bubble_budget = bubble_cycles
+                elif bubble_budget > 0:
+                    bubble_budget -= 1
+            elif bubble_budget > 0:
+                bubble_budget -= 1
             if not bundle:
                 break
             self.instrs.append(dict(bundle))
             if n_blocks:
-                rr = (rr + 1) % n_blocks
+                hold_rr = bubble_recovery and bubble_hold_rr and counts.get("load", 0) < SLOT_LIMITS["load"]
+                if not hold_rr:
+                    rr = (rr + 1) % n_blocks
                 if rr_mode == "round_robin":
                     rr_load = rr
                 else:
@@ -496,9 +679,13 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        if init_vars:
+            self.emit_cycle([("load", ("const", tmp1, 0))], tag="init:hdr")
+            for i, v in enumerate(init_vars):
+                slots = [("load", ("load", self.scratch[v], tmp1))]
+                if i + 1 < len(init_vars):
+                    slots.append(("load", ("const", tmp1, i + 1)))
+                self.emit_cycle(slots, tag="init:hdr")
 
         extra_room_size = n_nodes + batch_size * 2 + VLEN * 2 + 32
 
@@ -518,12 +705,14 @@ class KernelBuilder:
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_three = self.alloc_scratch("v_three", VLEN)
+        v_four = self.alloc_scratch("v_four", VLEN)
 
         vbroadcasts = [
             (v_zero, zero_const),
             (v_one, one_const),
             (v_two, two_const),
             (v_three, self.scratch_const(3)),
+            (v_four, self.scratch_const(4)),
         ]
 
         # Hash constants and fused stages
@@ -566,9 +755,12 @@ class KernelBuilder:
         use_flow_select = os.getenv("USE_FLOW_SELECT", "0") == "1"
         flow_select_depth1 = os.getenv("FLOW_SELECT_DEPTH1", "1") == "1"
         flow_select_depth2 = os.getenv("FLOW_SELECT_DEPTH2", "0") == "1"
+        flow_select_depth3 = os.getenv("FLOW_SELECT_DEPTH3", "0") == "1"
+        valu_tree_depth3 = os.getenv("VALU_TREE_DEPTH3", "0") == "1"
         if use_flow_select:
             flow_select_depth1 = True
             flow_select_depth2 = True
+            flow_select_depth3 = True
         fast_depth2_select = os.getenv("FAST_DEPTH2_SELECT", "1") != "0"
         fast_depth3_select = os.getenv("FAST_DEPTH3_SELECT", "1") != "0"
 
@@ -591,13 +783,17 @@ class KernelBuilder:
         v_depth3_diff60 = None
         v_depth3_diff70 = None
         need_node_off = False
+        special_depth2_addr = False
         if use_shallow_grouping:
             if shallow_group_depth >= 2 and not (flow_select_depth2 or fast_depth2_select):
                 need_node_off = True
-            if shallow_group_depth >= 3 and not fast_depth3_select:
+            if shallow_group_depth >= 3 and not (
+                fast_depth3_select or flow_select_depth3 or valu_tree_depth3
+            ):
                 need_node_off = True
             if shallow_group_depth >= 4:
                 need_node_off = True
+            special_depth2_addr = shallow_group_depth == 2 and not need_node_off
 
         if use_shallow_grouping:
             max_group_node = (1 << (shallow_group_depth + 1)) - 2
@@ -605,7 +801,10 @@ class KernelBuilder:
             node_vals_s = [
                 self.alloc_scratch(f"node_val_s_{i}") for i in range(max_group_node + 1)
             ]
-            node_idx_consts = [self.scratch_const(i) for i in range(max_group_node + 1)]
+            if special_depth2_addr:
+                node_idx_consts = [self.scratch_const(i) for i in range(5)]
+            else:
+                node_idx_consts = [self.scratch_const(i) for i in range(max_group_node + 1)]
             node_addr_s = [
                 self.alloc_scratch(f"node_addr_s_{i}") for i in range(max_group_node + 1)
             ]
@@ -623,6 +822,8 @@ class KernelBuilder:
             addr_ops = []
             with self.tag_scope("preamble:group_addr"):
                 for node_idx in range(max_group_node + 1):
+                    if special_depth2_addr and node_idx >= len(node_idx_consts):
+                        continue
                     addr_ops.append(
                         (
                             "alu",
@@ -644,6 +845,13 @@ class KernelBuilder:
                     slots = []
                     for j in range(i, min(max_group_node + 1, i + SLOT_LIMITS["load"])):
                         slots.append(("load", ("load", node_vals_s[j], node_addr_s[j])))
+                    if special_depth2_addr and i == 0:
+                        slots.append(
+                            ("alu", ("+", node_addr_s[5], node_addr_s[4], one_const))
+                        )
+                        slots.append(
+                            ("alu", ("+", node_addr_s[6], node_addr_s[4], two_const))
+                        )
                     self.emit_cycle(slots)
             idx_pairs = []
             val_pairs = []
@@ -672,7 +880,18 @@ class KernelBuilder:
             with self.tag_scope("preamble:group_broadcast"):
                 self.emit_vbroadcasts(val_pairs)
             diff_ops = []
-            if shallow_group_depth >= 1:
+            diff1_s = None
+            diff2_10_s = None
+            diff2_20_s = None
+            diff2_30_s = None
+            diff3_10_s = None
+            diff3_20_s = None
+            diff3_30_s = None
+            diff3_40_s = None
+            diff3_50_s = None
+            diff3_60_s = None
+            diff3_70_s = None
+            if shallow_group_depth >= 1 and not flow_select_depth1:
                 diff1_s = self.alloc_scratch("diff1_s")
                 base1 = (1 << 1) - 1
                 diff_ops.append(
@@ -681,7 +900,7 @@ class KernelBuilder:
                         ("-", diff1_s, node_vals_s[base1 + 1], node_vals_s[base1 + 0]),
                     )
                 )
-            if shallow_group_depth >= 2:
+            if shallow_group_depth >= 2 and fast_depth2_select and not flow_select_depth2:
                 base2 = (1 << 2) - 1
                 diff2_10_s = self.alloc_scratch("diff2_10_s")
                 diff2_20_s = self.alloc_scratch("diff2_20_s")
@@ -702,7 +921,9 @@ class KernelBuilder:
                         ),
                     ]
                 )
-            if shallow_group_depth >= 3:
+            if shallow_group_depth >= 3 and fast_depth3_select and not (
+                flow_select_depth3 or valu_tree_depth3
+            ):
                 base3 = (1 << 3) - 1
                 diff3_10_s = self.alloc_scratch("diff3_10_s")
                 diff3_20_s = self.alloc_scratch("diff3_20_s")
@@ -746,11 +967,11 @@ class KernelBuilder:
             if diff_ops:
                 with self.tag_scope("preamble:group_diff"):
                     self.emit_cycle(diff_ops)
-            if shallow_group_depth >= 1:
+            if diff1_s is not None:
                 v_depth1_diff = self.alloc_scratch("v_depth1_diff", VLEN)
                 with self.tag_scope("preamble:group_diff"):
                     self.emit_cycle([("valu", ("vbroadcast", v_depth1_diff, diff1_s))])
-            if shallow_group_depth >= 2:
+            if diff2_10_s is not None:
                 v_depth2_diff10 = self.alloc_scratch("v_depth2_diff10", VLEN)
                 v_depth2_diff20 = self.alloc_scratch("v_depth2_diff20", VLEN)
                 v_depth2_diff30 = self.alloc_scratch("v_depth2_diff30", VLEN)
@@ -762,7 +983,7 @@ class KernelBuilder:
                             (v_depth2_diff30, diff2_30_s),
                         ]
                     )
-            if shallow_group_depth >= 3:
+            if diff3_10_s is not None:
                 v_depth3_diff10 = self.alloc_scratch("v_depth3_diff10", VLEN)
                 v_depth3_diff20 = self.alloc_scratch("v_depth3_diff20", VLEN)
                 v_depth3_diff30 = self.alloc_scratch("v_depth3_diff30", VLEN)
@@ -1114,8 +1335,14 @@ class KernelBuilder:
             start_base_idx_const = self.scratch_const((1 << start_depth) - 1)
 
         interleave_addr_load = os.getenv("INTERLEAVE_ADDR_LOAD", "0") == "1"
+        trim_last_wave = os.getenv("TRIM_LAST_WAVE", "0") == "1"
         wave_size = int(os.getenv("WAVE_SIZE", "468"))
-        num_tmp = 3 if flow_select_depth2 else 2
+        if flow_select_depth3 or valu_tree_depth3:
+            num_tmp = 4
+        elif flow_select_depth2:
+            num_tmp = 3
+        else:
+            num_tmp = 2
         max_wave = (SCRATCH_SIZE - self.scratch_ptr) // (VLEN * num_tmp)
         if max_wave < 1:
             raise ValueError("Not enough scratch for wave temp vectors")
@@ -1128,9 +1355,13 @@ class KernelBuilder:
         # Per-block scratch for a wave
         tmp1_vec_b = [self.alloc_scratch(f"tmp1_vec_{i}", VLEN) for i in range(scratch_wave)]
         tmp2_vec_b = [self.alloc_scratch(f"tmp2_vec_{i}", VLEN) for i in range(scratch_wave)]
-        if flow_select_depth2:
+        if flow_select_depth2 or flow_select_depth3 or valu_tree_depth3:
             tmp3_vec_b = [
                 self.alloc_scratch(f"tmp3_vec_{i}", VLEN) for i in range(scratch_wave)
+            ]
+        if flow_select_depth3 or valu_tree_depth3:
+            tmp4_vec_b = [
+                self.alloc_scratch(f"tmp4_vec_{i}", VLEN) for i in range(scratch_wave)
             ]
 
         round_plans = []
@@ -1155,7 +1386,8 @@ class KernelBuilder:
         for wi in range(waves):
             ops_by_block = []
             base_block = wi * wave_size
-            for bi in range(wave_size):
+            wave_blocks = min(wave_size, blocks - base_block) if trim_last_wave else wave_size
+            for bi in range(wave_blocks):
                 block_idx = base_block + bi
                 if block_idx >= blocks:
                     ops_by_block.append([])
@@ -1336,6 +1568,291 @@ class KernelBuilder:
                                         tmp2_vec_b[bi],
                                     ),
                                     "group:d2",
+                                )
+                                node_val_src = tmp2_vec_b[bi]
+                            elif depth == 3 and valu_tree_depth3:
+                                # Tree-based VALU selection using bit masks.
+                                # b0 = idx & 1
+                                add_op(
+                                    "valu",
+                                    ("&", tmp1_vec_b[bi], idx_vec, v_one),
+                                    "group:d3",
+                                )
+                                # t0 = n0 + b0*(n1 - n0)
+                                add_op(
+                                    "valu",
+                                    (
+                                        "-",
+                                        tmp2_vec_b[bi],
+                                        v_node_val_all + depth_offset + VLEN,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp2_vec_b[bi],
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d3",
+                                )
+                                # t1 = n2 + b0*(n3 - n2)
+                                add_op(
+                                    "valu",
+                                    (
+                                        "-",
+                                        tmp3_vec_b[bi],
+                                        v_node_val_all + depth_offset + 3 * VLEN,
+                                        v_node_val_all + depth_offset + 2 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp3_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                        v_node_val_all + depth_offset + 2 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                # b1 = (idx & 2) >> 1
+                                add_op(
+                                    "valu",
+                                    ("&", tmp4_vec_b[bi], idx_vec, v_two),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (">>", tmp4_vec_b[bi], tmp4_vec_b[bi], v_one),
+                                    "group:d3",
+                                )
+                                # u0 = t0 + b1*(t1 - t0)
+                                add_op(
+                                    "valu",
+                                    ("-", tmp3_vec_b[bi], tmp3_vec_b[bi], tmp2_vec_b[bi]),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp4_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                # t2 = n4 + b0*(n5 - n4)
+                                add_op(
+                                    "valu",
+                                    (
+                                        "-",
+                                        tmp3_vec_b[bi],
+                                        v_node_val_all + depth_offset + 5 * VLEN,
+                                        v_node_val_all + depth_offset + 4 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp3_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                        v_node_val_all + depth_offset + 4 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                # t3 = n6 + b0*(n7 - n6) (overwrite b0 in tmp1 after this)
+                                add_op(
+                                    "valu",
+                                    (
+                                        "-",
+                                        tmp4_vec_b[bi],
+                                        v_node_val_all + depth_offset + 7 * VLEN,
+                                        v_node_val_all + depth_offset + 6 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp4_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp4_vec_b[bi],
+                                        v_node_val_all + depth_offset + 6 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                # b1 = (idx & 2) >> 1 (recompute into tmp1)
+                                add_op(
+                                    "valu",
+                                    ("&", tmp1_vec_b[bi], idx_vec, v_two),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (">>", tmp1_vec_b[bi], tmp1_vec_b[bi], v_one),
+                                    "group:d3",
+                                )
+                                # u1 = t2 + b1*(t3 - t2)
+                                add_op(
+                                    "valu",
+                                    ("-", tmp4_vec_b[bi], tmp4_vec_b[bi], tmp3_vec_b[bi]),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp3_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp4_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                # b2 = (idx & 4) >> 2
+                                add_op(
+                                    "valu",
+                                    ("&", tmp1_vec_b[bi], idx_vec, v_four),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (">>", tmp1_vec_b[bi], tmp1_vec_b[bi], v_two),
+                                    "group:d3",
+                                )
+                                # out = u0 + b2*(u1 - u0)
+                                add_op(
+                                    "valu",
+                                    ("-", tmp3_vec_b[bi], tmp3_vec_b[bi], tmp2_vec_b[bi]),
+                                    "group:d3",
+                                )
+                                add_op(
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                node_val_src = tmp2_vec_b[bi]
+                            elif depth == 3 and flow_select_depth3:
+                                # b0 = off & 1
+                                add_op(
+                                    "valu",
+                                    ("&", tmp1_vec_b[bi], idx_vec, v_one),
+                                    "group:d3",
+                                )
+                                # s0 = select(node1, node0) by b0
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp2_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_node_val_all + depth_offset + VLEN,
+                                        v_node_val_all + depth_offset,
+                                    ),
+                                    "group:d3",
+                                )
+                                # s1 = select(node3, node2) by b0
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp3_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_node_val_all + depth_offset + 3 * VLEN,
+                                        v_node_val_all + depth_offset + 2 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                # b1 = off & 2
+                                add_op(
+                                    "valu",
+                                    ("&", tmp4_vec_b[bi], idx_vec, v_two),
+                                    "group:d3",
+                                )
+                                # t0 = select(s1, s0) by b1
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp2_vec_b[bi],
+                                        tmp4_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                # s2 = select(node5, node4) by b0
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp3_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_node_val_all + depth_offset + 5 * VLEN,
+                                        v_node_val_all + depth_offset + 4 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                # s3 = select(node7, node6) by b0 (dest overwrites b0)
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp1_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        v_node_val_all + depth_offset + 7 * VLEN,
+                                        v_node_val_all + depth_offset + 6 * VLEN,
+                                    ),
+                                    "group:d3",
+                                )
+                                # t1 = select(s3, s2) by b1
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp3_vec_b[bi],
+                                        tmp4_vec_b[bi],
+                                        tmp1_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                    ),
+                                    "group:d3",
+                                )
+                                # b2 = off & 4
+                                add_op(
+                                    "valu",
+                                    ("&", tmp4_vec_b[bi], idx_vec, v_four),
+                                    "group:d3",
+                                )
+                                # node_val = select(t1, t0) by b2
+                                add_op(
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        tmp2_vec_b[bi],
+                                        tmp4_vec_b[bi],
+                                        tmp3_vec_b[bi],
+                                        tmp2_vec_b[bi],
+                                    ),
+                                    "group:d3",
                                 )
                                 node_val_src = tmp2_vec_b[bi]
                             elif (
@@ -1628,7 +2145,10 @@ class KernelBuilder:
                     self.emit_cycle([("store", ("store", tmp_addr, tmp_val))])
 
         # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        if self.instrs and "flow" not in self.instrs[-1]:
+            self.instrs[-1].setdefault("flow", []).append(("pause",))
+        else:
+            self.instrs.append({"flow": [("pause",)]})
         self.resolve_fixups()
 
 
