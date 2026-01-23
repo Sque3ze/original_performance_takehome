@@ -44,8 +44,19 @@ def run_cycles(
     seed: int | None,
     quiet: bool,
 ):
-    from tests import submission_tests as st
+    import importlib.util
     import random
+
+    tests_dir = os.path.join(ROOT, "tests")
+    submission_path = os.path.join(tests_dir, "submission_tests.py")
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+
+    spec = importlib.util.spec_from_file_location("submission_tests", submission_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Failed to load submission_tests.py")
+    st = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(st)
 
     if seed is not None:
         random.seed(seed)
